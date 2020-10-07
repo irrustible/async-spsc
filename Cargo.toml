@@ -1,0 +1,11 @@
+[package]
+name = "async-spsc"
+version = "0.1.0"
+authors = ["James Laver <james.laver@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+futures-micro="0.3.1"
+futures-lite = "1"
+concurrent-queue = "1.*"
+atomic-waker = "1"
