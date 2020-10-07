@@ -8,10 +8,8 @@ Fast, async-aware, single-producer, single-consumer (SPSC) channels.
 
 Features:
 
-* Probably the fastest oneshot channel in the world (see 'Performance')
-* Tiny code, only one dependency and a blazing quick build.
+* Tiny code, low dependency and a blazing quick build.
 * Complete `no_std` support (with `alloc` for `Arc`).
-* Unique feature: sender may wait for a receiver to be waiting.
 
 ## Copyright and License
 
