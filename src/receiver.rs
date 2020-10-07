@@ -28,15 +28,31 @@ impl<T> Receiver<T> {
 impl<T> Stream for Receiver<T> {
     type Item = T;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<T>> {
-        match self.inner.try_recv() {
+        let this = Pin::into_inner(self);
+        match this.inner.try_recv() {
             Ok(val) => {
-                self.inner.wake_send();
+                this.inner.wake_send();
                 Poll::Ready(Some(val))
             }
-            Err(TryRecvError::Closed) => Poll::Ready(None),
             Err(TryRecvError::Empty) => {
-                self.inner.set_recv(ctx.waker());
-                Poll::Pending
+                this.inner.set_recv(ctx.waker());
+                match this.inner.try_recv() {
+                    Ok(val) => { // sorry for leaving a waker
+                        this.inner.wake_send();
+                        Poll::Ready(Some(val))
+                    }
+                    Err(TryRecvError::Empty) => {
+                        Poll::Pending
+                    }
+                    Err(TryRecvError::Closed) => {
+                        this.done = true;
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Err(TryRecvError::Closed) => {
+                this.done = true;
+                Poll::Ready(None)
             }
         }
     }

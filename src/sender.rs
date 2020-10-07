@@ -58,9 +58,21 @@ impl<T> Sender<T> {
                     Poll::Ready(Ok(()))
                 }
                 Err(TrySendError::Full(val)) => {
-                    *opt = Some(val);
                     self.inner.set_send(ctx.waker());
-                    Poll::Pending
+                    match self.inner.try_send(val) {
+                        Ok(()) => { // sorry for leaving a waker
+                            self.inner.wake_recv();
+                            Poll::Ready(Ok(()))
+                        }
+                        Err(TrySendError::Full(val)) => {
+                            *opt = Some(val);
+                            Poll::Pending
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            self.done = true;
+                            Poll::Ready(Err(Closed()))
+                        }
+                    }
                 }
                 Err(TrySendError::Closed(_)) => {
                     self.done = true;
