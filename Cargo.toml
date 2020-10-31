@@ -3,6 +3,7 @@ name = "async-spsc"
 version = "0.1.0"
 authors = ["James Laver <james.laver@gmail.com>"]
 edition = "2018"
+license = "MPL-2.0"
 
 [dependencies]
 futures-micro = "0.3.1"
