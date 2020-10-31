@@ -11,7 +11,6 @@ pub struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-
     #[inline]
     pub(crate) fn new(queue: ConcurrentQueue<T>) -> Self {
         Inner {
