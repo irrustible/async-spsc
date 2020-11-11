@@ -3,7 +3,6 @@ use alloc::sync::Arc;
 use core::task::Poll;
 use core::future::Future;
 use futures_micro::*;
-// use futures_micro::poll_state;
 
 /// The sending half of a oneshot channel.
 #[derive(Debug)]
@@ -51,7 +50,8 @@ impl<T> Sender<T> {
     /// Sends a message on the channel. Fails if the Receiver is dropped.
     #[inline]
     pub fn send<'a>(&'a mut self, value: T) -> impl Future<Output=Result<(), Closed>> + 'a {
-        poll_state(Some(value), move |opt, ctx| {
+        let mut opt = Some(value);
+        poll_fn(move |ctx| {
             match self.inner.try_send(opt.take().unwrap()) {
                 Ok(()) => {
                     self.inner.wake_recv();
@@ -65,7 +65,7 @@ impl<T> Sender<T> {
                             Poll::Ready(Ok(()))
                         }
                         Err(TrySendError::Full(val)) => {
-                            *opt = Some(val);
+                            opt = Some(val);
                             Poll::Pending
                         }
                         Err(TrySendError::Closed(_)) => {

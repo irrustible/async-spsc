@@ -5,7 +5,18 @@ authors = ["James Laver <james.laver@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-futures-micro="0.3.1"
+futures-micro = "0.4.0"
 futures-lite = "1"
 concurrent-queue = "1.*"
 atomic-waker = "1"
+
+[dev-dependencies]
+criterion = { version = "0.3", features = ["real_blackbox"] }
+
+# [[bench]]
+# name = "oneshot"
+# harness = false
+
+[[bench]]
+name = "bounded_10"
+harness = false
