@@ -1,22 +1,37 @@
 [package]
 name = "async-spsc"
-version = "0.1.0"
+version = "0.2.0"
+description = "Fast, easy-to-use, async-aware single-producer/single-consumer (SPSC) channel."
 authors = ["James Laver <james.laver@gmail.com>"]
 edition = "2018"
 
-[dependencies]
-futures-micro = "0.4.0"
-futures-lite = "1"
-concurrent-queue = "1.*"
-atomic-waker = "1"
+[features]
+default = ["alloc", "async", "ring", "stream"]
+alloc = []
+async = []
+ring = ["atomic-waker"]
+stream = ["async", "futures-core"]
+bench = ["criterion"]
+
+[dependencies.atomic-waker]
+version = "1.0.0"
+optional = true
+
+[dependencies.futures-core]
+version = "0.3.16"
+default-features = false
+optional = true
+
+[dependencies.criterion]
+version = "0.3"
+features = ["real_blackbox"]
+optional = true
 
 [dev-dependencies]
-criterion = { version = "0.3", features = ["real_blackbox"] }
-
-# [[bench]]
-# name = "oneshot"
-# harness = false
+dummy-waker = "1"
+futures-micro = "1.0.0-rc0"
+wookie = "0.3"
 
 [[bench]]
-name = "bounded_10"
+name = "contiguous_async_1"
 harness = false
