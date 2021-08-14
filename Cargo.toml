@@ -6,10 +6,9 @@ authors = ["James Laver <james.laver@gmail.com>"]
 edition = "2018"
 
 [features]
-default = ["alloc", "async", "ring", "stream"]
-alloc = []
-async = []
-ring = ["atomic-waker"]
+default = ["alloc", "async", "stream"]
+alloc = ["pages"]
+async = ["atomic-waker"]
 stream = ["async", "futures-core"]
 bench = ["criterion"]
 
@@ -25,6 +24,10 @@ optional = true
 [dependencies.criterion]
 version = "0.3"
 features = ["real_blackbox"]
+optional = true
+
+[dependencies.pages]
+version = "0.2.0"
 optional = true
 
 [dev-dependencies]

@@ -24,6 +24,8 @@ impl HalfState {
     #[inline(always)]
     pub fn position(self) -> Half { self.0 & !(1 << (BITS - 1)) }
 
+    pub fn index(self, capacity: Half) -> usize { (self.0 % capacity) as usize }
+
     #[inline(always)]
     pub fn is_closed(self) -> bool { (self.0 & HIGH_BIT) != 0 }
 

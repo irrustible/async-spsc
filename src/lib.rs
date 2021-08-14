@@ -31,29 +31,25 @@
 //! }
 //! ```
 #![no_std]
+
 #[cfg(feature="alloc")]
 extern crate alloc;
 
-use core::cell::UnsafeCell;
-use core::convert::TryInto;
 use core::marker::PhantomData;
-// use core::fmt;
 use core::mem::MaybeUninit;
-use core::ops::Deref;
-use core::ptr::NonNull;
+use core::ptr::{NonNull, drop_in_place};
 use core::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature="async")]
 use core::{future::Future, pin::Pin, task::{Context, Poll}};
-#[cfg(feature="alloc")]
-use alloc::alloc::{alloc, dealloc, Layout, LayoutError};
 
 #[cfg(feature="async")]
 use atomic_waker::AtomicWaker;
 
+#[cfg(feature="alloc")]
+use pages::*;
+
 mod state;
 use state::*;
-mod slice;
-use slice::*;
 pub mod sender;
 pub use sender::*;
 pub mod receiver;
@@ -64,13 +60,13 @@ const WAITING: u8 = 1;
 
 #[derive(Debug)]
 enum Holder<'a, 'b, T> {
-    // Lifetime-bound reference. Unable to free
-    Ref(&'a Spsc<'b, T>),
-    // A pointer we do not own and will not attempt to free.
-    BorrowedPtr(NonNull<Spsc<'b, T>>),
-    // A pointer we manage with our contiguous layout strategy.
+    /// A pointer we do not own and will not attempt to free.
+    BorrowedPtr(NonNull<Spsc<'b, T>>, PhantomData<&'a ()>),
+    /// A pointer to a page we manage. This is an owned object we are
+    /// abusing, so we need to suppress its destructor and manually
+    /// drop it only when both sides are done.
     #[cfg(feature="alloc")]
-    Contiguous(NonNull<Spsc<'b, T>>),
+    Page(PageRef<Atomics, T>),
     // // A pointer produced from [`Box::leak`] that's potentially
     // // shared with other holders.
     // #[cfg(feature="alloc")]
@@ -80,10 +76,9 @@ enum Holder<'a, 'b, T> {
 impl<'a, 'b, T> Clone for Holder<'a, 'b, T> {
     fn clone(&self) -> Self {
         match self {
-            Holder::Ref(r) => Holder::Ref(r),
-            Holder::BorrowedPtr(r) => Holder::BorrowedPtr(*r),
+            Holder::BorrowedPtr(r, p) => Holder::BorrowedPtr(*r, *p),
             #[cfg(feature="alloc")]
-            Holder::Contiguous(r) => Holder::Contiguous(*r),
+            Holder::Page(r) => Holder::Page(*r),
             // #[cfg(feature="alloc")]
             // Holder::SharedBoxPtr(r) => Holder::SharedBoxPtr(*r),
         }
@@ -92,35 +87,35 @@ impl<'a, 'b, T> Clone for Holder<'a, 'b, T> {
 
 impl<'a, 'b, T> Copy for Holder<'a, 'b, T> {}
 
-impl<'a, 'b, T> Deref for Holder<'a, 'b, T> {
-    type Target = Spsc<'b, T>;
-    fn deref(&self) -> &Spsc<'b, T> {
-        match self {
-            Holder::Ref(b) => b,
-            Holder::BorrowedPtr(ptr)  => unsafe { ptr.as_ref() },
-            #[cfg(feature="alloc")]
-            Holder::Contiguous(c) => unsafe { c.as_ref() },
-            // #[cfg(feature="alloc")]
-            // Holder::SharedBoxPtr(ptr) => unsafe { ptr.as_ref() },
-        }
-    }
-}
-
 impl<'a, 'b, T> Holder<'a, 'b, T> {
 
+    #[inline(always)]
+    fn atomics(&self) -> *const Atomics {
+        match self {
+            Holder::BorrowedPtr(r, _) => &unsafe { r.as_ref() }.atomics,
+            Holder::Page(p) => unsafe { p.header() }
+        }
+    }
+
+    #[inline(always)]
+    fn data(&mut self) -> *mut MaybeUninit<T> {
+        match self {
+            Holder::BorrowedPtr(r, _) => unsafe { r.as_ref() }.data(),
+            Holder::Page(p) => unsafe { p.data() },
+        }
+    }
+
     // Safe only if we are the last referent to the spsc.
-    unsafe fn cleanup(self, cap: Half, state: State) {
+    unsafe fn cleanup(self, capacity: Half, state: State) {
         // whatever we are, we are going to drop the inflight items
         // and the wakers if there are any.
         match self {
-            Holder::Ref(r) => r.cleanup(state),
-            Holder::BorrowedPtr(ptr) => ptr.as_ref().cleanup(state),
+            Holder::BorrowedPtr(ptr, _) => 
+                ptr.as_ref().cleanup(capacity, state),
             #[cfg(feature="alloc")]
-            Holder::Contiguous(c) => {
-                c.as_ref().cleanup(state);
-                // We also need to free the spsc
-                let layout = ContiguousLayout::for_capacity::<T>(cap).unwrap();
-                dealloc(c.as_ptr().cast(), layout.layout);
+            Holder::Page(c) => {
+                drop_in_flight(c.data(), capacity, state);
+                PageRef::drop(c);
             }
         }
     }
@@ -132,121 +127,94 @@ impl<'a, 'b, T> Holder<'a, 'b, T> {
     // }
 }
 
+fn drop_in_flight<T>(items: *mut MaybeUninit<T>, capacity: Half, state: State) {
+    // TODO: probably not optimal
+    let front = state.front().position();
+    let mut back = state.back();
+    loop {
+        let b = back.position();
+        if front == b { break; }
+        let index = (b % capacity) as usize;
+        unsafe { drop_in_place(items.add(index));  }
+        back = back.advance(capacity, 1);
+    }
+}
+
 /// Creates a new heap-backed [`Spsc`] that can store up to `capacity`
 /// in-flight messages at a time.
-// This is a bit horrific, to be frank. The idea is to allocate data
-// and ring in a continuous block instead of each individually, thus
-// only requiring one alloc/free instead of two.
-//
-// That said, it isn't particularly difficult to reason about.
 pub fn spsc<T>(capacity: Half) -> (Sender<'static, 'static, T>, Receiver<'static, 'static, T>) {
     // First we must check we can handle this capacity.
     assert!(capacity > 0);
     assert!(capacity <= MAX_CAPACITY);
-    // First we get our pertinent layout details and allocate the raw data.
-    let layout = ContiguousLayout::for_capacity::<T>(capacity).unwrap();
-    let raw = unsafe { alloc(layout.layout) };
-    // Now we'll synthesise the data slice.
-    let data: *mut MaybeUninit<T> = unsafe { raw.add(layout.data) }.cast();
-    let data = unsafe { core::slice::from_raw_parts_mut(data, capacity as usize) };
-    // Now initialise the spsc.
-    let spsc: *mut Spsc<T> = raw.cast();
-    unsafe { spsc.write(Spsc::make(Slice::Ref(data))); }
-    // Now we can create a holder and use it to create both sides.
-    let spsc = Holder::Contiguous(unsafe { NonNull::new_unchecked(spsc) });
-    (Sender::new(spsc, State(0), capacity), Receiver::new(spsc, State(0), capacity))
+    let page = PageRef::new(Atomics::default(), capacity);
+    let holder = Holder::Page(page);
+    (Sender::new(holder, State(0), capacity), Receiver::new(holder, State(0), capacity))
 }
 
-#[repr(C)] // very important for knowing the layout
 #[derive(Debug)]
 pub struct Spsc<'a, T> {
-    // Atomics is likely to fit in a cache line:
-    //
-    // * 2x AtomicWaker @ 3 words = 6 words
-    // * 1x atomicusize @ 1 word = 7 words.
-    //
-    // Buffer is alas 2 words, though we might squeeze it down either
-    // by reimplementing AtomicWaker to support two wakers or by using ointers.
-    //
     atomics:  Atomics,
-    buffer:   UnsafeCell<Slice<'a, T>>,
-    _marker:  PhantomData<T>,
+    ptr:      NonNull<MaybeUninit<T>>,
+    capacity: Half,
+    _phantom: PhantomData<&'a T>
 }
 
 impl<'a, T> Spsc<'a, T> {
-    /// ## Safety
-    ///
-    /// * ptr must point to a len-sized array of appropriately aligned
-    ///   and padded T which should already be initialised.
-    ///
-    /// Note: will panic if length is 0 or greater than can be
-    /// represented in two bits less than half a usize.
-    pub unsafe fn from_nonnull_len(ptr: NonNull<MaybeUninit<T>>, len: Half) -> Self {
-        assert!(len > 0, "the spsc buffer must have a non-zero length");
-        assert!(len <= MAX_CAPACITY, "the spsc buffer must have a length representable in two bits less than half a usize");
-        Self::make(Slice::BorrowedPtrLen(ptr, len))
+    fn cleanup(&self, capacity: Half, state: State) {
+        // Safe because we have exclusive access
+        drop_in_flight(self.data(), capacity, state);
+        // Avoid a potential memory leak.
+        self.atomics.drop_wakers();
     }
 
-    /// ## Safety
-    ///
-    /// * len must not be zero
-    /// * ptr must point to a len-sized array of appropriately aligned
-    ///   and padded T which should already be initialised.
-    ///
-    /// Note: will panic if length is 0 or greater than can be
-    /// represented in two bits less than half a usize.
-    pub unsafe fn from_raw_parts(ptr: *mut MaybeUninit<T>, len: Half) -> Self {
-        assert!(len > 0, "the spsc buffer must have a non-zero length");
-        assert!(len <= MAX_CAPACITY, "the spsc buffer must have a length representable in two bits less than half a usize");
-        Self::make(Slice::BorrowedPtrLen(NonNull::new_unchecked(ptr), len))
-    }
-
-    // the private constructor
-    fn make(buffer: Slice<'a, T>) -> Self {
-        Spsc {
-            atomics: Atomics::default(),
-            buffer: UnsafeCell::new(buffer),
-            _marker: PhantomData,
-        }
-    }
-
-    // the private destructor
-    unsafe fn cleanup(&self, state: State) {
-        let _s = self.atomics.sender.take();
-        let _r = self.atomics.receiver.take();
-        (*self.buffer.get()).cleanup(state);
-    }
+    fn data(&self) -> *mut MaybeUninit<T> { self.ptr.as_ptr() }
 }
 
-impl<'a, T> From<&'a mut [MaybeUninit<T>]> for Spsc<'a, T> {
-    fn from(r: &'a mut [MaybeUninit<T>]) -> Self { Self::make(Slice::Ref(r)) }
-}
+impl<'a, T> Spsc<'a, T> {
+    // /// ## Safety
+    // ///
+    // /// * ptr must point to a len-sized array of appropriately aligned
+    // ///   and padded T which should already be initialised.
+    // ///
+    // /// Note: will panic if length is 0 or greater than can be
+    // /// represented in two bits less than half a usize.
+    // pub unsafe fn from_nonnull_len(ptr: NonNull<MaybeUninit<T>>, len: Half) -> Self {
+    //     assert!(len > 0, "the spsc buffer must have a non-zero length");
+    //     assert!(len <= MAX_CAPACITY, "the spsc buffer must have a length representable in two bits less than half a usize")
+    //     Spsc();
+    //     Self::make(Slice::BorrowedPtrLen(ptr, len))
+    // }
 
-#[cfg(feature="alloc")]
-struct ContiguousLayout {
-    layout: Layout,
-    data:   usize,
-}
-    
-#[cfg(feature="alloc")]
-impl ContiguousLayout {
-    // This only works because of the #[repr(C)] on `Spsc`.
-    fn for_capacity<T>(size: Half) -> Result<ContiguousLayout, LayoutError> {
-        let atomics = Layout::new::<Atomics>();
-        let buffer = Layout::new::<Slice<T>>();
-        let array = Layout::array::<T>(size as usize)?;
-        let (layout, data) = atomics.extend(buffer)?.0.extend(array)?;
-        Ok(ContiguousLayout { layout, data })
-    }
+//     // /// ## Safety
+//     // ///
+//     // /// * len must not be zero
+//     // /// * ptr must point to a len-sized array of appropriately aligned
+//     // ///   and padded T which should already be initialised.
+//     // ///
+//     // /// Note: will panic if length is 0 or greater than can be
+//     // /// represented in two bits less than half a usize.
+//     // pub unsafe fn from_raw_parts(ptr: *mut MaybeUninit<T>, len: Half) -> Self {
+//     //     assert!(len > 0, "the spsc buffer must have a non-zero length");
+//     //     assert!(len <= MAX_CAPACITY, "the spsc buffer must have a length representable in two bits less than half a usize");
+//     //     Self::make(Slice::BorrowedPtrLen(NonNull::new_unchecked(ptr), len))
+//     // }
+
 }
 
 #[derive(Debug,Default)]
-struct Atomics {
+pub struct Atomics {
     state:    AtomicUsize,
     #[cfg(feature="async")]
     sender:   AtomicWaker,
     #[cfg(feature="async")]
     receiver: AtomicWaker,
+}
+
+impl Atomics {
+    fn drop_wakers(&self) {
+        let _s = self.sender.take();
+        let _r = self.receiver.take();
+    }
 }
 
 #[derive(Debug,Eq,Hash,PartialEq)]
